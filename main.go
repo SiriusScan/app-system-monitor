@@ -10,33 +10,43 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/SiriusScan/go-api/sirius/store"
 )
 
-// SystemMetrics represents system resource metrics
+const (
+	sampleInterval = 5 * time.Second
+	metricsTTL     = 60 * time.Second
+	writeTimeout   = 2 * time.Second
+)
+
+// SystemMetrics is an observation made by the collector. Legacy Uptime and
+// Status describe the collector only, and are retained for existing readers.
 type SystemMetrics struct {
-	ContainerName   string    `json:"container_name"`
-	Timestamp       time.Time `json:"timestamp"`
-	CPUPercent      float64   `json:"cpu_percent"`
-	MemoryUsage     int64     `json:"memory_usage_bytes"`
-	MemoryPercent   float64   `json:"memory_percent"`
-	NetworkRx       int64     `json:"network_rx_bytes"`
-	NetworkTx       int64     `json:"network_tx_bytes"`
-	DiskRead        int64     `json:"disk_read_bytes"`
-	DiskWrite       int64     `json:"disk_write_bytes"`
-	DiskUsage       int64     `json:"disk_usage_bytes"`
-	DiskTotal       int64     `json:"disk_total_bytes"`
-	DiskPercent     float64   `json:"disk_percent"`
-	ProcessCount    int       `json:"process_count"`
-	FileDescriptors int       `json:"file_descriptors"`
-	LoadAverage1m   float64   `json:"load_average_1m"`
-	LoadAverage5m   float64   `json:"load_average_5m"`
-	LoadAverage15m  float64   `json:"load_average_15m"`
-	Uptime          int64     `json:"uptime_seconds"`
-	Status          string    `json:"status"`
+	ContainerName          string    `json:"container_name"`
+	Timestamp              time.Time `json:"timestamp"`
+	CollectorStartedAt     time.Time `json:"collector_started_at"`
+	CollectorUptimeSeconds int64     `json:"collector_uptime_seconds"`
+	CPUPercent             float64   `json:"cpu_percent"`
+	MemoryUsage            int64     `json:"memory_usage_bytes"`
+	MemoryPercent          float64   `json:"memory_percent"`
+	NetworkRx              int64     `json:"network_rx_bytes"`
+	NetworkTx              int64     `json:"network_tx_bytes"`
+	DiskRead               int64     `json:"disk_read_bytes"`
+	DiskWrite              int64     `json:"disk_write_bytes"`
+	DiskUsage              int64     `json:"disk_usage_bytes"`
+	DiskTotal              int64     `json:"disk_total_bytes"`
+	DiskPercent            float64   `json:"disk_percent"`
+	ProcessCount           int       `json:"process_count"`
+	FileDescriptors        int       `json:"file_descriptors"`
+	LoadAverage1m          float64   `json:"load_average_1m"`
+	LoadAverage5m          float64   `json:"load_average_5m"`
+	LoadAverage15m         float64   `json:"load_average_15m"`
+	Uptime                 int64     `json:"uptime_seconds"`
+	Status                 string    `json:"status"`
 }
 
 // ContainerLog represents a container log entry
@@ -47,11 +57,16 @@ type ContainerLog struct {
 	Message       string    `json:"message"`
 }
 
-// SystemMonitor handles system metrics collection and reporting
+type monitorStore interface {
+	SetValue(context.Context, string, string) error
+	SetValueWithTTL(context.Context, string, string, int) error
+	Close() error
+}
+
+// SystemMonitor handles system metrics collection and reporting.
 type SystemMonitor struct {
 	containerName string
-	valkeyStore   store.KVStore
-	metricsChan   chan SystemMetrics
+	valkeyStore   monitorStore
 	logsChan      chan ContainerLog
 	startTime     time.Time
 	lastCPUUsage  int64
@@ -60,7 +75,7 @@ type SystemMonitor struct {
 }
 
 // NewSystemMonitor creates a new system monitor instance
-func NewSystemMonitor(containerName string) (*SystemMonitor, error) {
+func NewSystemMonitor(containerName string, startedAt time.Time) (*SystemMonitor, error) {
 	// Initialize Valkey store
 	valkeyStore, err := store.NewValkeyStore()
 	if err != nil {
@@ -73,9 +88,8 @@ func NewSystemMonitor(containerName string) (*SystemMonitor, error) {
 	return &SystemMonitor{
 		containerName: containerName,
 		valkeyStore:   valkeyStore,
-		metricsChan:   make(chan SystemMetrics, 10),
 		logsChan:      make(chan ContainerLog, 100),
-		startTime:     time.Now(),
+		startTime:     startedAt,
 		lastCPUUsage:  0,
 		lastCPUTime:   time.Now(),
 		cpuCores:      cpuCores,
@@ -86,42 +100,52 @@ func NewSystemMonitor(containerName string) (*SystemMonitor, error) {
 func (sm *SystemMonitor) Start(ctx context.Context) error {
 	log.Printf("Starting system monitor for container: %s", sm.containerName)
 
-	// Start metrics collection
-	go sm.collectMetrics(ctx)
-
-	// Start log collection
-	go sm.collectLogs(ctx)
-
-	// Start metrics reporting
-	go sm.reportMetrics(ctx)
-
-	// Start log reporting
-	go sm.reportLogs(ctx)
-
-	// Wait for context cancellation
-	<-ctx.Done()
+	var workers sync.WaitGroup
+	for _, run := range []func(context.Context){sm.collectMetrics, sm.collectLogs, sm.reportLogs} {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			run(ctx)
+		}()
+	}
+	workers.Wait()
 	log.Printf("System monitor stopping for container: %s", sm.containerName)
 	return nil
 }
 
-// collectMetrics collects system metrics at regular intervals
+// collectMetrics samples immediately and subsequently on the normal cadence.
 func (sm *SystemMonitor) collectMetrics(ctx context.Context) {
-	ticker := time.NewTicker(5 * time.Second)
+	ticker := time.NewTicker(sampleInterval)
 	defer ticker.Stop()
 
-	for {
+	sm.publishSamples(ctx, ticker.C, time.Now, sm.gatherSystemMetrics)
+}
+
+func (sm *SystemMonitor) publishSamples(
+	ctx context.Context, ticks <-chan time.Time, now func() time.Time, gather func() SystemMetrics,
+) {
+	for ctx.Err() == nil {
+		metrics := gather()
+		if err := sm.storeMetrics(ctx, sm.observeMetrics(now(), metrics)); err != nil && ctx.Err() == nil {
+			log.Printf("Could not publish metrics for %s", sm.containerName)
+		}
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
-			metrics := sm.gatherSystemMetrics()
-			select {
-			case sm.metricsChan <- metrics:
-			default:
-				log.Printf("Warning: metrics channel full, dropping metrics")
-			}
+		case <-ticks:
 		}
 	}
+}
+
+func (sm *SystemMonitor) observeMetrics(observedAt time.Time, metrics SystemMetrics) SystemMetrics {
+	uptime := int64(max(observedAt.Sub(sm.startTime), 0) / time.Second)
+	metrics.ContainerName = sm.containerName
+	metrics.Timestamp = observedAt.UTC()
+	metrics.CollectorStartedAt = sm.startTime.UTC()
+	metrics.CollectorUptimeSeconds = uptime
+	metrics.Uptime = uptime
+	metrics.Status = "running"
+	return metrics
 }
 
 // collectLogs collects container logs
@@ -163,20 +187,6 @@ func (sm *SystemMonitor) collectLogs(ctx context.Context) {
 	}
 }
 
-// reportMetrics reports metrics to Valkey
-func (sm *SystemMonitor) reportMetrics(ctx context.Context) {
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case metrics := <-sm.metricsChan:
-			if err := sm.storeMetrics(metrics); err != nil {
-				log.Printf("Error storing metrics: %v", err)
-			}
-		}
-	}
-}
-
 // reportLogs reports logs to Valkey
 func (sm *SystemMonitor) reportLogs(ctx context.Context) {
 	for {
@@ -184,7 +194,7 @@ func (sm *SystemMonitor) reportLogs(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case logEntry := <-sm.logsChan:
-			if err := sm.storeLog(logEntry); err != nil {
+			if err := sm.storeLog(ctx, logEntry); err != nil && ctx.Err() == nil {
 				log.Printf("Error storing log: %v", err)
 			}
 		}
@@ -200,11 +210,8 @@ func (sm *SystemMonitor) gatherSystemMetrics() SystemMetrics {
 	diskInfo := sm.readDiskInfo()
 	processInfo := sm.readProcessInfo()
 	loadInfo := sm.readLoadAverage()
-	uptime := sm.readUptime()
 
 	return SystemMetrics{
-		ContainerName:   sm.containerName,
-		Timestamp:       time.Now(),
 		CPUPercent:      cpuInfo,
 		MemoryUsage:     memInfo.Usage,
 		MemoryPercent:   memInfo.Percent,
@@ -220,8 +227,6 @@ func (sm *SystemMonitor) gatherSystemMetrics() SystemMetrics {
 		LoadAverage1m:   loadInfo.Load1m,
 		LoadAverage5m:   loadInfo.Load5m,
 		LoadAverage15m:  loadInfo.Load15m,
-		Uptime:          uptime,
-		Status:          "running",
 	}
 }
 
@@ -649,15 +654,8 @@ func (sm *SystemMonitor) readLoadAverage() LoadInfo {
 	}
 }
 
-// readUptime reads container uptime
-func (sm *SystemMonitor) readUptime() int64 {
-	// Return the actual time since the system monitor started
-	// This gives us a reasonable approximation of container uptime
-	return int64(time.Since(sm.startTime).Seconds())
-}
-
 // storeMetrics stores metrics in Valkey
-func (sm *SystemMonitor) storeMetrics(metrics SystemMetrics) error {
+func (sm *SystemMonitor) storeMetrics(ctx context.Context, metrics SystemMetrics) error {
 	key := fmt.Sprintf("system:metrics:%s", sm.containerName)
 
 	data, err := json.Marshal(metrics)
@@ -665,13 +663,13 @@ func (sm *SystemMonitor) storeMetrics(metrics SystemMetrics) error {
 		return fmt.Errorf("failed to marshal metrics: %w", err)
 	}
 
-	// Store in Valkey (no expiration for now)
-	ctx := context.Background()
-	return sm.valkeyStore.SetValue(ctx, key, string(data))
+	ctx, cancel := context.WithTimeout(ctx, writeTimeout)
+	defer cancel()
+	return sm.valkeyStore.SetValueWithTTL(ctx, key, string(data), int(metricsTTL/time.Second))
 }
 
 // storeLog stores log entry in Valkey
-func (sm *SystemMonitor) storeLog(logEntry ContainerLog) error {
+func (sm *SystemMonitor) storeLog(ctx context.Context, logEntry ContainerLog) error {
 	key := fmt.Sprintf("system:logs:%s:%d", sm.containerName, time.Now().UnixNano())
 
 	data, err := json.Marshal(logEntry)
@@ -679,42 +677,38 @@ func (sm *SystemMonitor) storeLog(logEntry ContainerLog) error {
 		return fmt.Errorf("failed to marshal log: %w", err)
 	}
 
-	// Store in Valkey (no expiration for now)
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(ctx, writeTimeout)
+	defer cancel()
 	return sm.valkeyStore.SetValue(ctx, key, string(data))
 }
 
 func main() {
-	// Get container name from environment variable
+	startedAt := time.Now()
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
 	containerName := os.Getenv("CONTAINER_NAME")
 	if containerName == "" {
 		containerName = "unknown"
 	}
 
-	// Create system monitor
-	monitor, err := NewSystemMonitor(containerName)
-	if err != nil {
-		log.Fatalf("Failed to create system monitor: %v", err)
+	retry := time.NewTicker(sampleInterval)
+	defer retry.Stop()
+	for ctx.Err() == nil {
+		monitor, err := NewSystemMonitor(containerName, startedAt)
+		if err == nil {
+			defer monitor.valkeyStore.Close()
+			if err := monitor.Start(ctx); err != nil {
+				log.Printf("System monitor failed: %v", err)
+			}
+			return
+		}
+
+		log.Print("Valkey unavailable at startup. Retrying system monitor connection.")
+		select {
+		case <-ctx.Done():
+			return
+		case <-retry.C:
+		}
 	}
-
-	// Create context for graceful shutdown
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	// Handle shutdown signals
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-
-	go func() {
-		<-sigChan
-		log.Println("Received shutdown signal")
-		cancel()
-	}()
-
-	// Start monitoring
-	if err := monitor.Start(ctx); err != nil {
-		log.Fatalf("System monitor failed: %v", err)
-	}
-
-	log.Println("System monitor stopped")
 }
