@@ -1,0 +1,32 @@
+name: Verify collector observation fixtures
+
+on:
+  push:
+    branches:
+      - codex/verify-measured-resource-fields
+
+permissions:
+  contents: read
+
+jobs:
+  offline-collector:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: c03287ce967333bb0fb6bf29b3f8c772bd03930d
+          persist-credentials: false
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Run offline fixture tests with the race detector
+        run: go test -race main.go main_test.go
+
+      - name: Build the collector
+        env:
+          CGO_ENABLED: '0'
+        run: go build -o "$RUNNER_TEMP/system-monitor-verifier" main.go
